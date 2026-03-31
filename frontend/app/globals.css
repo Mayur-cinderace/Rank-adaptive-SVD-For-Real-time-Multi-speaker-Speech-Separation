@@ -1,0 +1,167 @@
+:root {
+  --bg: #f3f7f2;
+  --ink: #10251e;
+  --accent: #0f8a5f;
+  --accent-2: #e9f7f1;
+  --card: #ffffff;
+  --danger: #c62b2b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(circle at 15% 15%, #d8efe4 0%, transparent 40%),
+    radial-gradient(circle at 90% 0%, #cfe7dc 0%, transparent 30%),
+    var(--bg);
+  color: var(--ink);
+  font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+}
+
+main {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 2rem 1rem 3rem;
+}
+
+h1 {
+  margin: 0;
+  font-size: clamp(1.8rem, 3.5vw, 2.7rem);
+}
+
+.sub {
+  margin: 0.4rem 0 1.6rem;
+  opacity: 0.8;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 1rem;
+}
+
+@media (min-width: 920px) {
+  .grid {
+    grid-template-columns: 360px 1fr;
+  }
+}
+
+.card {
+  background: var(--card);
+  border-radius: 18px;
+  padding: 1rem;
+  border: 1px solid #d6e6de;
+  box-shadow: 0 12px 25px rgba(16, 37, 30, 0.06);
+}
+
+.stack {
+  display: grid;
+  gap: 0.75rem;
+}
+
+label {
+  font-size: 0.92rem;
+  font-weight: 700;
+}
+
+input,
+select,
+button,
+textarea {
+  width: 100%;
+  border-radius: 10px;
+  border: 1px solid #c8dbd2;
+  padding: 0.6rem 0.75rem;
+  font-size: 0.95rem;
+}
+
+button {
+  cursor: pointer;
+  background: var(--accent);
+  color: white;
+  border: none;
+  font-weight: 700;
+}
+
+button.secondary {
+  background: #355b50;
+}
+
+button.ghost {
+  background: #eef4f1;
+  color: #23473b;
+  border: 1px solid #d0e2da;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.inline {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+}
+
+.meta {
+  background: var(--accent-2);
+  border: 1px solid #b5ddca;
+  border-radius: 12px;
+  padding: 0.8rem;
+  line-height: 1.6;
+}
+
+.wave-wrap {
+  margin-top: 0.75rem;
+}
+
+.spectrogram {
+  margin-top: 0.75rem;
+  width: 100%;
+  border-radius: 10px;
+  border: 1px solid #d4e5dd;
+}
+
+.error {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+.ok {
+  color: #13724f;
+  font-weight: 700;
+}
+
+.rec-capsule {
+  border-radius: 999px;
+  border: 1px solid #ffd1d1;
+  background: #fff2f2;
+  color: #8b1f1f;
+  padding: 0.55rem 0.8rem;
+  font-weight: 700;
+}
+
+.mic-btn {
+  width: 88px;
+  height: 88px;
+  border-radius: 999px;
+  margin: 0 auto;
+  display: block;
+  font-size: 1.75rem;
+  background: linear-gradient(180deg, #ff6f61 0%, #db3c3c 100%);
+  box-shadow: 0 10px 20px rgba(198, 43, 43, 0.3);
+}
+
+.small {
+  font-size: 0.85rem;
+  opacity: 0.8;
+}
+
+audio {
+  width: 100%;
+  margin-top: 0.4rem;
+}

@@ -1,0 +1,27 @@
+# --- Core API ---
+fastapi
+uvicorn[standard]
+python-multipart
+
+# --- Audio processing ---
+numpy
+scipy
+librosa
+soundfile
+pydub
+resampy
+
+# --- Visualization ---
+matplotlib
+
+# --- Evaluation metrics ---
+pystoi
+pesq
+mir_eval
+
+# --- Neural separation (optional but used in code) ---
+torch
+asteroid
+
+# --- Utilities (implicitly used) ---
+typing_extensions
