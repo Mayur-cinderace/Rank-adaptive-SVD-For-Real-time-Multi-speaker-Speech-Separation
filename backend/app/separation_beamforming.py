@@ -126,7 +126,9 @@ def _delay_and_sum(prep: PreparedSignal, delays: list[int]) -> np.ndarray:
             d_abs = -d
             aligned[m, :T - d_abs] = sig[d_abs:]
 
-    return np.mean(aligned, axis=0).astype(np.float32)
+    output = np.mean(aligned, axis=0)
+    output = output / (np.max(np.abs(output)) + 1e-8)
+    return output.astype(np.float32)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

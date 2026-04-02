@@ -222,7 +222,7 @@ def run_neural_separation(
         logger.error("Neural model unavailable: %s", exc)
         return SeparationResult(
             method="neural",
-            separated_channels=[mixture.copy()],
+            separated_channels=[mixture.copy(), mixture.copy()],
             sr=prep.sr,
             metadata={"error": str(exc), "model_id": cfg.model_id},
         )
@@ -238,7 +238,7 @@ def run_neural_separation(
         logger.error("Neural inference failed: %s", exc)
         return SeparationResult(
             method="neural",
-            separated_channels=[mixture.copy()],
+            separated_channels=[mixture.copy(), mixture.copy()],
             sr=prep.sr,
             metadata={"error": str(exc), "model_id": cfg.model_id},
         )

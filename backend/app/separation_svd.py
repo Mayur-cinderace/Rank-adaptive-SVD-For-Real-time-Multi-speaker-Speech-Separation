@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -27,11 +27,13 @@ from .preprocessing import (
     SeparationResult,
     build_time_domain_frames,
     compute_istft,
-    compute_stft,
     overlap_add,
 )
 
 logger = logging.getLogger(__name__)
+
+SVD_EPS: float = 1e-6
+LOW_ENERGY_EPS: float = 1e-10
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -43,7 +45,7 @@ class SVDConfig:
     """All tuneable hyperparameters for the rank-adaptive SVD method."""
 
     # Energy threshold τ — tuned on LibriMix dev set (sweep 0.80–0.95)
-    tau: float = 0.90
+    tau: float = 0.85
 
     # If True, use frequency-domain STFT frames (better spectral resolution)
     # If False, use time-domain frames (lower latency, as in architecture diagram)
@@ -63,29 +65,76 @@ class SVDConfig:
 # Core rank selection (the novel rule — Equation in §6 of research doc)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def adaptive_rank(singular_values: np.ndarray, tau: float = 0.90) -> int:
-    """
-    Returns r*, the minimum rank capturing fraction tau of total energy.
-
-    ε_k = σ_k² / Σ_i σ_i²
-    r* = min { r : Σ_{k=1}^{r} ε_k ≥ τ }
-
-    Parameters
-    ----------
-    singular_values : (M,) float — sorted descending (guaranteed by np.linalg.svd)
-    tau             : energy threshold in (0, 1)
-
-    Returns
-    -------
-    r_star : int — adaptive rank for this frame
-    """
+def robust_rank(
+    singular_values: np.ndarray,
+    tau: float = 0.90,
+    min_ratio: float = 0.1,
+    max_sources: int = 3,
+) -> int:
+    """Hybrid rank rule: cumulative energy + relative strength with stability cap."""
     energy = singular_values ** 2
-    total = energy.sum()
-    if total < 1e-12:
+    total = float(energy.sum())
+
+    if total < LOW_ENERGY_EPS:
         return 1
+
     cumulative = np.cumsum(energy) / total
-    r_star = int(np.searchsorted(cumulative, tau)) + 1
-    return min(r_star, len(singular_values))
+    r_energy = int(np.searchsorted(cumulative, tau)) + 1
+
+    ratios = singular_values / (float(singular_values[0]) + LOW_ENERGY_EPS)
+    r_ratio = int(np.sum(ratios > min_ratio))
+
+    r_star = min(r_energy, r_ratio, max_sources)
+    return max(1, r_star)
+
+
+def _smooth_rank_trace(ranks: list[int], window: int = 5) -> list[int]:
+    """Moving-average smoothing to stabilize per-frame rank estimates."""
+    if not ranks:
+        return []
+    arr = np.asarray(ranks, dtype=np.float32)
+    if len(arr) < window:
+        return [int(max(1, round(v))) for v in arr]
+
+    kernel = np.ones(window, dtype=np.float32) / float(window)
+    smoothed = np.convolve(arr, kernel, mode="same")
+    return [int(max(1, round(v))) for v in smoothed]
+
+
+def _postprocess_sources(sources: list[np.ndarray], keep_top_n: int = 2) -> tuple[list[np.ndarray], list[float]]:
+    """Remove DC, normalize, then keep strongest perceptually distinct sources."""
+    if not sources:
+        return [], []
+
+    dc_removed: list[np.ndarray] = []
+    energies: list[float] = []
+    for src in sources:
+        x = np.asarray(src, dtype=np.float32).copy()
+        x -= float(np.mean(x))
+        e = float(np.mean(x ** 2))
+        dc_removed.append(x)
+        energies.append(e)
+
+    if not energies:
+        return [], []
+
+    max_energy = max(energies)
+    keep = [i for i, e in enumerate(energies) if e >= 0.1 * max_energy]
+    if not keep:
+        keep = [int(np.argmax(energies))]
+
+    keep = sorted(keep, key=lambda i: energies[i], reverse=True)[: max(1, keep_top_n)]
+    kept_sources = [dc_removed[i] for i in keep]
+    kept_energies = [energies[i] for i in keep]
+
+    # Final per-source normalization for stable listening level.
+    for i, src in enumerate(kept_sources):
+        src /= float(np.max(np.abs(src)) + 1e-8)
+        kept_sources[i] = src.astype(np.float32)
+
+    denom = float(sum(kept_energies)) + 1e-10
+    energy_distribution = [float(e / denom) for e in kept_energies]
+    return kept_sources, energy_distribution
 
 
 def wiener_gain(
@@ -120,7 +169,7 @@ def wiener_gain(
 def _svd_frequency_domain(
     prep: PreparedSignal,
     cfg: SVDConfig,
-) -> list[np.ndarray]:
+) -> tuple[list[np.ndarray], dict]:
     """
     Process each STFT frequency bin independently with SVD.
 
@@ -134,48 +183,68 @@ def _svd_frequency_domain(
     M, n_bins, n_frames = prep.stft_matrix.shape  # (M, F, N)
 
     # We separate up to max_sources — for each source, hold its STFT
-    n_sources = min(cfg.max_sources, M)
+    n_sources = min(3, M, cfg.max_sources)
     source_stfts = [
         np.zeros((n_bins, n_frames), dtype=np.complex64)
         for _ in range(n_sources)
     ]
 
-    # Track per-frame r* for diagnostics
-    r_stars: list[int] = []
+    raw_ranks: list[int] = []
+    svd_bins: list[tuple[np.ndarray, np.ndarray, np.ndarray] | None] = []
+    singular_bank: list[np.ndarray] = []
 
     for f in range(n_bins):
-        # X_f: (M, N_frames)
         Xf = prep.stft_matrix[:, f, :]  # complex64
-
-        # SVD — economy form
-        try:
-            U, s, Vh = np.linalg.svd(Xf, full_matrices=False)
-        except np.linalg.LinAlgError:
+        frame_energy = float(np.mean(np.abs(Xf) ** 2))
+        if frame_energy < LOW_ENERGY_EPS:
+            raw_ranks.append(1)
+            svd_bins.append(None)
             continue
 
-        r_star = max(
-            cfg.min_rank,
-            min(adaptive_rank(s, cfg.tau), n_sources),
-        )
-        r_stars.append(r_star)
+        Xf_reg = Xf + SVD_EPS
+        try:
+            U, s, Vh = np.linalg.svd(Xf_reg, full_matrices=False)
+        except np.linalg.LinAlgError:
+            raw_ranks.append(1)
+            svd_bins.append(None)
+            continue
 
-        gains = wiener_gain(s, r_star) if cfg.use_wiener else np.ones(r_star)
+        r_star = robust_rank(s, tau=cfg.tau, min_ratio=0.1, max_sources=min(3, n_sources))
+        r_star = max(cfg.min_rank, min(r_star, n_sources))
+        raw_ranks.append(r_star)
+        svd_bins.append((U, s, Vh))
+        singular_bank.append(s)
 
-        # Reconstruct each source component
+    smooth_ranks = _smooth_rank_trace(raw_ranks, window=5)
+
+    for f in range(n_bins):
+        svd_parts = svd_bins[f]
+        if svd_parts is None:
+            continue
+        U, s, Vh = svd_parts
+        r_star = max(cfg.min_rank, min(smooth_ranks[f], n_sources, len(s)))
+        gains = wiener_gain(s, r_star) if cfg.use_wiener else np.ones(r_star, dtype=np.float32)
+
         for k in range(min(r_star, n_sources)):
-            # Rank-1 outer product for component k, scaled by Wiener gain
-            comp = gains[k] * s[k] * np.outer(U[:, k], Vh[k, :])
-            # Project onto channel 0 (target speaker channel)
-            source_stfts[k][f, :] += comp[0, :]
+            uk = U[:, k]
+            vk = Vh[k, :]
+            weights = np.abs(uk)
+            wsum = float(np.sum(weights))
+            if wsum <= LOW_ENERGY_EPS:
+                continue
+            weights = weights / wsum
+            mix_coeff = np.sum(weights * uk)
+            component = gains[k] * s[k] * mix_coeff * vk
+            source_stfts[k][f, :] += component.astype(np.complex64)
 
     logger.debug(
         "SVD freq-domain: mean r* = %.2f over %d bins",
-        float(np.mean(r_stars)) if r_stars else 0.0,
+        float(np.mean(smooth_ranks)) if smooth_ranks else 0.0,
         n_bins,
     )
 
     # iSTFT for each source
-    sources: list[np.ndarray] = []
+    sources_raw: list[np.ndarray] = []
     for k in range(n_sources):
         wav = compute_istft(
             source_stfts[k],
@@ -184,9 +253,33 @@ def _svd_frequency_domain(
             win_length=prep.win_length,
             length=prep.n_samples,
         )
-        sources.append(wav)
+        sources_raw.append(wav)
 
-    return sources
+    sources, energy_distribution = _postprocess_sources(sources_raw, keep_top_n=2)
+
+    avg_rank = int(np.round(np.mean(smooth_ranks))) if smooth_ranks else 1
+    if singular_bank:
+        first10 = np.zeros(10, dtype=np.float64)
+        for s in singular_bank:
+            take = min(10, len(s))
+            first10[:take] += s[:take]
+        first10 /= max(1, len(singular_bank))
+    else:
+        first10 = np.zeros(10, dtype=np.float64)
+    if first10[0] > 0:
+        first10 = first10 / first10[0]
+
+    diagnostics = {
+        "rank_trace": [int(v) for v in smooth_ranks],
+        "rank_trace_raw": [int(v) for v in raw_ranks],
+        "rank_per_frame": [int(v) for v in smooth_ranks],
+        "rank_trace_domain": "frequency_bins",
+        "first_10_singular_values": [float(v) for v in first10.tolist()],
+        "singular_value_spectrum": [float(v) for v in first10.tolist()],
+        "energy_distribution": energy_distribution,
+        "estimated_sources": avg_rank,
+    }
+    return sources, diagnostics
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -196,7 +289,7 @@ def _svd_frequency_domain(
 def _svd_time_domain(
     prep: PreparedSignal,
     cfg: SVDConfig,
-) -> list[np.ndarray]:
+) -> tuple[list[np.ndarray], dict]:
     """
     Form X ∈ R^(M × T_frame) per time frame and apply rank-adaptive SVD.
 
@@ -208,7 +301,7 @@ def _svd_time_domain(
     sources : list of (T,) float32
     """
     M, T = prep.waveform.shape
-    n_sources = min(cfg.max_sources, M)
+    n_sources = min(3, M, cfg.max_sources)
 
     # Use channel 0 as reference for framing parameters
     frames_ref, frame_len, hop_len = build_time_domain_frames(prep.waveform[0])
@@ -220,7 +313,9 @@ def _svd_time_domain(
         for _ in range(n_sources)
     ]
 
-    r_stars: list[int] = []
+    raw_ranks: list[int] = []
+    svd_frames: list[tuple[np.ndarray, np.ndarray, np.ndarray] | None] = []
+    singular_bank: list[np.ndarray] = []
 
     for i in range(n_frames):
         start = i * hop_len
@@ -232,39 +327,86 @@ def _svd_time_domain(
             chunk = prep.waveform[m, start:min(end, T)]
             X[m, : len(chunk)] = chunk
 
-        try:
-            U, s, Vh = np.linalg.svd(X, full_matrices=False)
-        except np.linalg.LinAlgError:
+        frame_energy = float(np.mean(X ** 2))
+        if frame_energy < LOW_ENERGY_EPS:
+            raw_ranks.append(1)
+            svd_frames.append(None)
             continue
 
-        r_star = max(
-            cfg.min_rank,
-            min(adaptive_rank(s, cfg.tau), n_sources),
-        )
-        r_stars.append(r_star)
+        X_reg = X + SVD_EPS
 
-        gains = wiener_gain(s, r_star) if cfg.use_wiener else np.ones(r_star)
+        try:
+            U, s, Vh = np.linalg.svd(X_reg, full_matrices=False)
+        except np.linalg.LinAlgError:
+            raw_ranks.append(1)
+            svd_frames.append(None)
+            continue
 
-        # Reconstruct each source from its singular triplet
+        r_star = robust_rank(s, tau=cfg.tau, min_ratio=0.1, max_sources=min(3, n_sources))
+        r_star = max(cfg.min_rank, min(r_star, n_sources))
+        raw_ranks.append(r_star)
+        svd_frames.append((U, s, Vh))
+        singular_bank.append(s)
+
+    smooth_ranks = _smooth_rank_trace(raw_ranks, window=5)
+
+    for i in range(n_frames):
+        svd_parts = svd_frames[i]
+        if svd_parts is None:
+            continue
+        U, s, Vh = svd_parts
+        r_star = max(cfg.min_rank, min(smooth_ranks[i], n_sources, len(s)))
+        gains = wiener_gain(s, r_star) if cfg.use_wiener else np.ones(r_star, dtype=np.float32)
+
         for k in range(min(r_star, n_sources)):
-            # Rank-1 approximation: component k in row-space of X
-            # Row 0 of the reconstruction = target channel contribution
-            comp_row0 = gains[k] * s[k] * U[0, k] * Vh[k, :]
-            source_frames[k][i] = comp_row0.astype(np.float32)
+            uk = U[:, k]
+            vk = Vh[k, :]
+            weights = np.abs(uk)
+            wsum = float(np.sum(weights))
+            if wsum <= LOW_ENERGY_EPS:
+                continue
+            weights = weights / wsum
+            mix_coeff = np.sum(weights * uk)
+            component = gains[k] * s[k] * mix_coeff * vk
+            source_frames[k][i] = np.asarray(np.real(component), dtype=np.float32)
 
     logger.debug(
         "SVD time-domain: mean r* = %.2f over %d frames",
-        float(np.mean(r_stars)) if r_stars else 0.0,
+        float(np.mean(smooth_ranks)) if smooth_ranks else 0.0,
         n_frames,
     )
 
     # Overlap-add reconstruction
-    sources: list[np.ndarray] = []
+    sources_raw: list[np.ndarray] = []
     for k in range(n_sources):
         wav = overlap_add(source_frames[k], frame_len, hop_len, T)
-        sources.append(wav)
+        sources_raw.append(wav)
 
-    return sources
+    sources, energy_distribution = _postprocess_sources(sources_raw, keep_top_n=2)
+
+    avg_rank = int(np.round(np.mean(smooth_ranks))) if smooth_ranks else 1
+    if singular_bank:
+        first10 = np.zeros(10, dtype=np.float64)
+        for s in singular_bank:
+            take = min(10, len(s))
+            first10[:take] += s[:take]
+        first10 /= max(1, len(singular_bank))
+    else:
+        first10 = np.zeros(10, dtype=np.float64)
+    if first10[0] > 0:
+        first10 = first10 / first10[0]
+
+    diagnostics = {
+        "rank_trace": [int(v) for v in smooth_ranks],
+        "rank_trace_raw": [int(v) for v in raw_ranks],
+        "rank_per_frame": [int(v) for v in smooth_ranks],
+        "rank_trace_domain": "time_frames",
+        "first_10_singular_values": [float(v) for v in first10.tolist()],
+        "singular_value_spectrum": [float(v) for v in first10.tolist()],
+        "energy_distribution": energy_distribution,
+        "estimated_sources": avg_rank,
+    }
+    return sources, diagnostics
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -302,17 +444,15 @@ def run_svd_separation(
         )
 
     if cfg.frequency_domain:
-        sources = _svd_frequency_domain(prep, cfg)
+        sources, diagnostics = _svd_frequency_domain(prep, cfg)
     else:
-        sources = _svd_time_domain(prep, cfg)
+        sources, diagnostics = _svd_time_domain(prep, cfg)
 
     elapsed = time.perf_counter() - t0
     rtf = elapsed / prep.duration_sec if prep.duration_sec > 0 else None
 
-    # Compute per-frame r* diagnostics (stored in metadata for the frontend)
-    # Re-derive quickly from the mono mix for logging
-    _, s_diag, _ = np.linalg.svd(prep.waveform, full_matrices=False)
-    r_global = adaptive_rank(s_diag, cfg.tau)
+    rank_trace = diagnostics.get("rank_trace", [])
+    avg_rank = int(diagnostics.get("estimated_sources", 1))
 
     return SeparationResult(
         method="svd",
@@ -323,7 +463,15 @@ def run_svd_separation(
             "tau": cfg.tau,
             "frequency_domain": cfg.frequency_domain,
             "wiener": cfg.use_wiener,
-            "global_rank_estimate": r_global,
+            "estimated_sources": avg_rank,
+            "rank_trace": rank_trace,
+            "rank_per_frame": diagnostics.get("rank_per_frame", rank_trace),
+            "rank_trace_raw": diagnostics.get("rank_trace_raw", []),
+            "rank_trace_domain": diagnostics.get("rank_trace_domain"),
+            "first_10_singular_values": diagnostics.get("first_10_singular_values", []),
+            "singular_value_spectrum": diagnostics.get("singular_value_spectrum", []),
+            "energy_distribution": diagnostics.get("energy_distribution", []),
+            "rank_trace_points": len(rank_trace),
             "n_sources_returned": len(sources),
             "processing_time_sec": round(elapsed, 4),
         },

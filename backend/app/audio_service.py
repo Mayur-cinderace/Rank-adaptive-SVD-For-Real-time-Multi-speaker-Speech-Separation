@@ -2,8 +2,8 @@
 backend/app/audio_service.py
 
 Audio ingestion & preprocessing layer for the multi-speaker speech-separation
-pipeline. Downstream stages (beamforming → diarization → separation →
-enhancement) consume the InputRecord from the shared InputStore via input_id.
+pipeline. Downstream separation stages consume InputRecord entries from the
+shared InputStore via input_id.
 """
 
 from __future__ import annotations
@@ -145,6 +145,33 @@ def apply_processing(X_raw: np.ndarray, normalize: bool, noise_level: float) -> 
     if noise_level > 0:
         X += np.random.randn(*X.shape).astype(np.float32) * float(noise_level)
     return X
+
+
+def simulate_multichannel(signal: np.ndarray, sr: int, n_mics: int = 3) -> np.ndarray:
+    """
+    Create synthetic multi-mic observations from a mono signal.
+
+    Each channel is a delayed copy with small additive noise to preserve
+    spatial diversity cues for rank estimation and beamforming.
+    """
+    mono = np.asarray(signal, dtype=np.float32)
+    channels: list[np.ndarray] = []
+    max_delay = max(1, int(0.001 * sr))  # up to 1 ms inter-channel delay
+    rng = np.random.default_rng()
+
+    for i in range(max(1, n_mics)):
+        delay = int(rng.integers(0, max_delay + 1)) if i > 0 else 0
+        shifted = np.zeros_like(mono)
+        if delay > 0:
+            shifted[delay:] = mono[:-delay]
+        else:
+            shifted = mono.copy()
+
+        amp = float(rng.uniform(0.92, 1.08))
+        noise = rng.normal(0.0, 0.008, len(mono)).astype(np.float32)
+        channels.append((amp * shifted + noise).astype(np.float32))
+
+    return np.stack(channels, axis=0)
 
 
 # ---------------------------------------------------------------------------
@@ -302,13 +329,25 @@ def process_uploaded_files(
     filenames: list[str] = []
     sr = TARGET_SR
 
-    for name, data in files:
+    items = list(files)
+    for name, data in items:
         sig, sr = load_audio_from_bytes(name, data, target_sr=TARGET_SR, fast_mode=fast_mode)
         signals.append(sig)
         filenames.append(name)
 
     if not signals:
         raise ValueError("No audio files were provided.")
+
+    if len(signals) == 1:
+        X_raw = simulate_multichannel(signals[0], sr, n_mics=3)
+        return build_response(
+            X_raw,
+            sr,
+            source="Simulated multi-mic",
+            normalize=normalize,
+            noise_level=noise_level,
+            channel_files=filenames,
+        )
 
     X_raw = align_signals(signals)
     return build_response(
@@ -387,7 +426,13 @@ def process_live_recording(
     """
     signal, sr = load_audio_from_bytes(name, audio_bytes, target_sr=TARGET_SR, fast_mode=fast_mode)
     delay_step = int(sr * per_mic_delay_ms / 1000.0)
-    channels = [apply_delay(signal, i * delay_step) for i in range(max(1, num_mics))]
+    rng = np.random.default_rng()
+    channels: list[np.ndarray] = []
+    for i in range(max(1, num_mics)):
+        delayed = apply_delay(signal, i * delay_step)
+        amp = float(rng.uniform(0.94, 1.06))
+        noise = rng.normal(0.0, 0.006, len(delayed)).astype(np.float32)
+        channels.append((amp * delayed + noise).astype(np.float32))
     X_raw = align_signals(channels)
 
     resp = build_response(

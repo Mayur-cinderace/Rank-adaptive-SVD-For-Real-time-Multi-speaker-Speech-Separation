@@ -44,6 +44,22 @@ def _get_input(input_id: str):
         raise HTTPException(status_code=404, detail=f"input_id '{input_id}' not found. Run /api/input/* first.")
     return record
 
+def _empty_result(method: str, error: str) -> dict:
+    return {
+        "method": method,
+        "sr": None,
+        "n_sources": 0,
+        "channels": [],
+        "metrics": {
+            "stoi": None,
+            "pesq": None,
+            "sdr_db": None,
+            "sir_db": None,
+            "sar_db": None,
+            "rtf": None,
+        },
+        "metadata": {"error": error},
+    }
 
 def _wav_b64(signal: np.ndarray, sr: int) -> str:
     """Encode a float32 array as a base64 WAV string for the frontend audio player."""
@@ -81,6 +97,7 @@ def _result_to_dict(result, include_audio: bool = True) -> dict:
         "method": result.method,
         "sr": result.sr,
         "n_sources": len(result.separated_channels),
+        "estimated_sources": result.metadata.get("estimated_sources"),
         "channels": channels_out,
         "metrics": {
             "stoi": result.stoi_scores[0] if result.stoi_scores else None,
@@ -119,7 +136,7 @@ def beamforming_endpoint(
         diagonal_loading=diagonal_loading,
     )
     result = run_beamforming(prep, cfg)
-    result = evaluate(result, reference=prep.mono_mix, sr=prep.sr)
+    result = evaluate(result, reference=prep.waveform[0], sr=prep.sr)
 
     return _result_to_dict(result)
 
@@ -131,7 +148,7 @@ def beamforming_endpoint(
 @router.post("/svd")
 def svd_endpoint(
     input_id: str = Form(...),
-    tau: float = Form(0.90),
+    tau: float = Form(0.85),
     frequency_domain: bool = Form(True),
     use_wiener: bool = Form(True),
     max_sources: int = Form(4),
@@ -154,7 +171,7 @@ def svd_endpoint(
         max_sources=max_sources,
     )
     result = run_svd_separation(prep, cfg)
-    result = evaluate(result, reference=prep.mono_mix, sr=prep.sr)
+    result = evaluate(result, reference=prep.waveform[0], sr=prep.sr)
 
     return _result_to_dict(result)
 
@@ -186,7 +203,7 @@ def neural_endpoint(
         chunk_duration_sec=chunk_duration_sec if chunk_duration_sec > 0 else None,
     )
     result = run_neural_separation(prep, cfg)
-    result = evaluate(result, reference=prep.mono_mix, sr=prep.sr)
+    result = evaluate(result, reference=prep.waveform[0], sr=prep.sr)
 
     return _result_to_dict(result)
 
@@ -199,11 +216,14 @@ def neural_endpoint(
 def compare_endpoint(
     input_id: str = Form(...),
     run_beamforming_flag: bool = Form(True),
+    run_das_flag: bool = Form(False),
+    run_mvdr_flag: bool = Form(True),
     run_svd_flag: bool = Form(True),
     run_neural_flag: bool = Form(False),    # off by default (needs asteroid)
-    # Beamforming params
+    # Beamforming params (shared)
     bf_variant: str = Form("mvdr"),
     bf_mic_spacing_m: float = Form(0.05),
+    bf_diagonal_loading: float = Form(1e-3),
     # SVD params
     svd_tau: float = Form(0.90),
     svd_frequency_domain: bool = Form(True),
@@ -227,19 +247,32 @@ def compare_endpoint(
     per_method_outputs = {}
 
     # ── Beamforming ──────────────────────────────────────────────────────
-    if run_beamforming_flag:
+    def _run_beamforming_variant(variant: str, key: str) -> None:
         try:
             bf_cfg = BeamformingConfig(
-                variant=bf_variant,
+                variant=variant,
                 mic_spacing_m=bf_mic_spacing_m,
+                diagonal_loading=bf_diagonal_loading,
             )
             bf_result = run_beamforming(prep, bf_cfg)
-            bf_result = evaluate(bf_result, reference=prep.mono_mix, sr=prep.sr)
+            # Frontend expects method ids aligned with configured method cards.
+            bf_result.method = key
+            bf_result = evaluate(bf_result, reference=prep.waveform[0], sr=prep.sr)
             results.append(bf_result)
-            per_method_outputs["beamforming"] = _result_to_dict(bf_result)
+            per_method_outputs[key] = _result_to_dict(bf_result)
         except Exception as exc:
-            logger.error("Beamforming failed: %s", exc)
-            per_method_outputs["beamforming"] = {"error": str(exc)}
+            logger.error("Beamforming (%s) failed: %s", key, exc)
+            per_method_outputs[key] = _empty_result(key, str(exc))
+
+    if run_beamforming_flag:
+        if run_das_flag:
+            _run_beamforming_variant("das", "das")
+        if run_mvdr_flag:
+            _run_beamforming_variant("mvdr", "mvdr")
+        # Backward-compat fallback for older clients that only send bf_variant.
+        if not run_das_flag and not run_mvdr_flag:
+            key = "mvdr" if bf_variant == "mvdr" else "das"
+            _run_beamforming_variant(bf_variant, key)
 
     # ── SVD ──────────────────────────────────────────────────────────────
     if run_svd_flag:
@@ -255,7 +288,7 @@ def compare_endpoint(
             per_method_outputs["svd"] = _result_to_dict(svd_result)
         except Exception as exc:
             logger.error("SVD failed: %s", exc)
-            per_method_outputs["svd"] = {"error": str(exc)}
+            per_method_outputs["svd"] = _empty_result("svd", str(exc))
 
     # ── Neural ───────────────────────────────────────────────────────────
     if run_neural_flag:
@@ -270,7 +303,7 @@ def compare_endpoint(
             per_method_outputs["neural"] = _result_to_dict(n_result)
         except Exception as exc:
             logger.error("Neural failed: %s", exc)
-            per_method_outputs["neural"] = {"error": str(exc)}
+            per_method_outputs["neural"] = _empty_result("neural", str(exc))
 
     return {
         "input_id": input_id,
